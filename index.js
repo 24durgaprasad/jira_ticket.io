@@ -3,16 +3,13 @@ import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
 import dotenv from 'dotenv';
-import { GoogleGenerativeAI } from '@google/generative-ai'; // <-- NEW IMPORT
+import { createWorker } from 'tesseract.js'; // local OCR, no API key needed
+// Using Perplexity's chat completion API
 
 // --- Basic Setup ---
 dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 5001;
-
-// --- Google AI Setup ---
-// Initialize the Google AI client with your API key from .env
-const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY);
 
 // --- Multer Setup ---
 const storage = multer.memoryStorage();
@@ -23,30 +20,182 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// --- OCR Helpers (Tesseract, no external keys) ---
+let tesseractWorkerPromise;
+
+async function getTesseractWorker() {
+  if (!tesseractWorkerPromise) {
+    tesseractWorkerPromise = (async () => {
+      const worker = await createWorker('eng');
+      return worker;
+    })();
+  }
+  return tesseractWorkerPromise;
+}
+
+async function extractTextFromImage(buffer) {
+  const worker = await getTesseractWorker();
+  const { data } = await worker.recognize(buffer);
+  const text = data?.text ? data.text.trim() : '';
+  if (!text) {
+    throw new Error('OCR produced no text from image.');
+  }
+  return text;
+}
+
+// --- Atlassian Document Format (ADF) helpers ---
+function toADF(text) {
+  return {
+    type: "doc",
+    version: 1,
+    content: [
+      {
+        type: "paragraph",
+        content: [{ type: "text", text: text || "" }],
+      },
+    ],
+  };
+}
+
+// --- Jira Helpers ---
+const EPIC_NAME_FIELD_ID = process.env.JIRA_EPIC_NAME_FIELD_ID || "customfield_10011";
+const EPIC_LINK_FIELD_ID = process.env.JIRA_EPIC_LINK_FIELD_ID || "customfield_10014";
+const EPIC_ISSUE_TYPE_NAME = process.env.JIRA_EPIC_ISSUETYPE_NAME || "Epic";
+const STORY_ISSUE_TYPE_NAME = process.env.JIRA_STORY_ISSUETYPE_NAME || "Story";
+
+function buildJiraAuthHeader(email, apiToken) {
+  const token = Buffer.from(`${email}:${apiToken}`).toString("base64");
+  return `Basic ${token}`;
+}
+
+async function createJiraIssue({ jiraUrl, authHeader, fields }) {
+  const endpoint = new URL('/rest/api/3/issue', jiraUrl).toString();
+  console.log('[Jira] Creating issue at', endpoint);
+  console.log('[Jira] Payload (fields keys):', Object.keys(fields));
+  if (fields.summary) console.log('[Jira] summary:', fields.summary);
+  if (fields.issuetype?.name) console.log('[Jira] issuetype:', fields.issuetype.name);
+  if (fields.project?.key) console.log('[Jira] project:', fields.project.key);
+  if (fields[EPIC_NAME_FIELD_ID]) console.log('[Jira] epic name field set:', EPIC_NAME_FIELD_ID);
+  if (fields[EPIC_LINK_FIELD_ID]) console.log('[Jira] epic link field set:', EPIC_LINK_FIELD_ID);
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      Authorization: authHeader,
+    },
+    body: JSON.stringify({ fields }),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    console.error('[Jira] Request failed', response.status, response.statusText, errorText);
+    throw new Error(
+      `Jira create issue failed: ${response.status} ${response.statusText} - ${errorText}`
+    );
+  }
+
+  return response.json();
+}
+
 // --- AI Helper Function ---
-// This function takes the raw text and asks Gemini to structure it.
+// This function takes the raw text and asks Perplexity to structure it.
 async function runAIAnalysis(requirementsText) {
-  // Use the 'gemini-pro' model which is good for text tasks
-  const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+  const apiKey = process.env.PERPLEXITY_API_KEY;
+  if (!apiKey) {
+    throw new Error("Missing PERPLEXITY_API_KEY in environment.");
+  }
 
-  // The prompt is the most important part. It tells the AI exactly what to do.
-  const prompt = process.env.SYSTEM_PROMPT
+  const systemPrompt =
+    process.env.SYSTEM_PROMPT ||
+    "You are a helpful assistant that converts plain requirements into JSON epics and stories.";
 
-  console.log("--- Sending prompt to AI... ---");
-  const result = await model.generateContent(prompt);
-  const response = await result.response;
-  const text = response.text();
-  
-  console.log("--- AI response received ---");
+  const body = {
+    // Perplexity model; defaults to supported "sonar-pro" if not provided
+    model: process.env.PERPLEXITY_MODEL || "sonar-pro",
+    messages: [
+      { role: "system", content: systemPrompt },
+      {
+        role: "user",
+        content: `Here are the raw requirements:\n\n${requirementsText}\n\nReturn only JSON.`,
+      },
+    ],
+  };
 
-  // Clean up the response in case Gemini adds markdown formatting
-  const cleanedText = text.replace(/^```json\s*|```\s*$/g, '');
-  
+  const endpoint = "https://api.perplexity.ai/chat/completions";
+  console.log("--- Sending prompt to AI (Perplexity)... ---");
+
+  const fetchWithTimeout = async (timeoutMs) => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+  };
+
+  const attempts = Number(process.env.PERPLEXITY_RETRIES || 2);
+  const timeoutMs = Number(process.env.PERPLEXITY_TIMEOUT_MS || 20000);
+  let response;
+  let lastError;
+
+  for (let i = 0; i <= attempts; i++) {
+    try {
+      response = await fetchWithTimeout(timeoutMs);
+      break;
+    } catch (err) {
+      lastError = err;
+      if (i === attempts) {
+        throw new Error(`Perplexity request failed after retries: ${err.message}`);
+      }
+      console.warn(`Perplexity attempt ${i + 1} failed, retrying...`, err.message);
+    }
+  }
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(
+      `Perplexity API error: ${response.status} ${response.statusText} - ${errorText}`
+    );
+  }
+
+  const data = await response.json();
+  const text = data?.choices?.[0]?.message?.content;
+
+  if (!text) {
+    throw new Error("Perplexity response missing content.");
+  }
+
+  // Try to robustly extract JSON even if model adds fences or pre/post text
+  const cleanedText = text
+    .replace(/^```[a-zA-Z]*\s*/, "")
+    .replace(/```$/, "")
+    .trim();
+
+  const attemptParse = (payload) => {
+    const start = payload.indexOf("{");
+    const end = payload.lastIndexOf("}");
+    if (start !== -1 && end !== -1 && end > start) {
+      return JSON.parse(payload.slice(start, end + 1));
+    }
+    return JSON.parse(payload);
+  };
+
   try {
-      return JSON.parse(cleanedText);
+    return attemptParse(cleanedText);
   } catch (e) {
-      console.error("Failed to parse AI response as JSON:", text);
-      throw new Error("AI response was not valid JSON.");
+    console.error("Failed to parse AI response as JSON:", text);
+    throw new Error(`AI response was not valid JSON. Raw response: ${text}`);
   }
 }
 
@@ -57,16 +206,51 @@ app.post('/api/generate-tickets', upload.single('requirementsFile'), async (req,
       return res.status(400).json({ message: 'No file uploaded.' });
     }
 
-    const fileContent = req.file.buffer.toString('utf8');
-    // We're not using these yet, but we're still receiving them for later
-    const { jiraUrl, projectKey, apiToken } = req.body;
+    const isImage = req.file.mimetype && req.file.mimetype.startsWith('image/');
+    let requirementsText;
+
+    if (isImage) {
+      console.log('--- Detected image upload, running OCR ---');
+      try {
+        requirementsText = await extractTextFromImage(req.file.buffer);
+      } catch (err) {
+        console.error('OCR failed:', err);
+        return res.status(400).json({
+          message: 'Could not extract text from image (OCR). Please upload a clearer image or a text file.',
+          error: err.message,
+        });
+      }
+    } else {
+      requirementsText = req.file.buffer.toString('utf8');
+    }
+    const { jiraUrl, projectKey, apiToken, email } = req.body;
+    console.log('[Request] jiraUrl:', jiraUrl);
+    console.log('[Request] projectKey:', projectKey);
+    console.log('[Request] email:', email);
+    console.log('[Request] Using epic name field:', EPIC_NAME_FIELD_ID || 'none');
+    console.log('[Request] Using epic link field:', EPIC_LINK_FIELD_ID || 'none');
+    console.log('[Request] Using epic issuetype name:', EPIC_ISSUE_TYPE_NAME);
+    console.log('[Request] Using story issuetype name:', STORY_ISSUE_TYPE_NAME);
+
+    if (!jiraUrl || !projectKey || !apiToken || !email) {
+      return res.status(400).json({ message: 'Missing Jira credentials or project info.' });
+    }
+
+    const normalizedJiraUrl = jiraUrl.startsWith('http') ? jiraUrl : `https://${jiraUrl}`;
+    try {
+      // Validate URL early to avoid silent bad hosts
+      new URL(normalizedJiraUrl);
+    } catch (err) {
+      return res.status(400).json({ message: 'Invalid Jira URL.' });
+    }
+    const jiraAuth = buildJiraAuthHeader(email, apiToken);
 
     console.log('\n--- 1. File Received ---');
     // console.log(fileContent); // Optional: comment out to keep logs cleaner
 
     // --- Step 2: Call the AI ---
     console.log('\n--- 2. Starting AI Analysis ---');
-    const structuredData = await runAIAnalysis(fileContent);
+    const structuredData = await runAIAnalysis(requirementsText);
 
     // --- LOGGING THE PARTITIONS (Epics, Stories) ---
     console.log('\n--- 3. AI Analysis Complete - Partitions Found ---');
@@ -84,18 +268,89 @@ app.post('/api/generate-tickets', upload.single('requirementsFile'), async (req,
         console.log("WARNING: No 'epics' array found in AI response.");
     }
 
+    // --- Step 3: Create Jira issues in real time ---
+    const creationResults = [];
+
+    if (structuredData.epics && Array.isArray(structuredData.epics)) {
+      for (const epic of structuredData.epics) {
+        const epicSummary = epic.summary || 'Epic';
+        const epicDescription = epic.description || '';
+
+        // Create Epic
+        const epicFields = {
+          project: { key: projectKey },
+          summary: epicSummary,
+          description: toADF(epicDescription),
+          issuetype: { name: EPIC_ISSUE_TYPE_NAME },
+        };
+        // Epic Name field (required for many company-managed projects). If your project does not
+        // require it, or uses a different field id, set JIRA_EPIC_NAME_FIELD_ID in .env or leave empty.
+        if (EPIC_NAME_FIELD_ID && EPIC_NAME_FIELD_ID !== 'skip') {
+          epicFields[EPIC_NAME_FIELD_ID] = epicSummary;
+        }
+
+        const epicIssue = await createJiraIssue({
+          jiraUrl: normalizedJiraUrl,
+          authHeader: jiraAuth,
+          fields: epicFields,
+        });
+
+        const epicKey = epicIssue.key;
+        const storiesCreated = [];
+
+        if (epic.stories && Array.isArray(epic.stories)) {
+          for (const story of epic.stories) {
+            const storyFields = {
+              project: { key: projectKey },
+              summary: story.summary || 'Story',
+              description: toADF(story.description || ''),
+              issuetype: { name: STORY_ISSUE_TYPE_NAME },
+            };
+
+            // Link story to epic (company-managed default field). Skip if unset/skip.
+            if (EPIC_LINK_FIELD_ID && EPIC_LINK_FIELD_ID !== 'skip') {
+              storyFields[EPIC_LINK_FIELD_ID] = epicKey;
+            }
+
+            const storyIssue = await createJiraIssue({
+              jiraUrl: normalizedJiraUrl,
+              authHeader: jiraAuth,
+              fields: storyFields,
+            });
+            storiesCreated.push(storyIssue.key);
+          }
+        }
+
+        creationResults.push({
+          epicKey,
+          stories: storiesCreated,
+        });
+      }
+    }
+
     // --- Final Response to Client ---
     res.status(200).json({
-      message: 'Requirements analyzed successfully!',
+      message: 'Requirements analyzed and Jira issues created successfully!',
       stats: {
         epics: structuredData.epics ? structuredData.epics.length : 0,
       },
-      // We send the full structured data back so you can see it in Postman
-      aiOutput: structuredData 
+      aiOutput: structuredData,
+      jira: creationResults,
+      notes: {
+        epicNameField: EPIC_NAME_FIELD_ID || null,
+        epicLinkField: EPIC_LINK_FIELD_ID || null,
+      },
     });
 
   } catch (error) {
     console.error('Error in /api/generate-tickets:', error);
+    // If the AI couldn't return JSON, surface a clearer 400 to the client
+    if (error.message && error.message.startsWith('AI response was not valid JSON')) {
+      return res.status(400).json({
+        message: 'AI response was not valid JSON. Ensure the uploaded file contains plain text requirements.',
+        error: error.message,
+      });
+    }
     res.status(500).json({ message: 'Server error during analysis', error: error.message });
   }
 });
