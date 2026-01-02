@@ -99,6 +99,35 @@ async function createJiraIssue({ jiraUrl, authHeader, fields }) {
   return response.json();
 }
 
+async function linkJiraIssues({ jiraUrl, authHeader, inwardIssue, outwardIssue, linkType = 'Relates' }) {
+  const endpoint = new URL('/rest/api/3/issueLink', jiraUrl).toString();
+  
+  const body = {
+    type: { name: linkType },
+    inwardIssue: { key: inwardIssue },
+    outwardIssue: { key: outwardIssue }
+  };
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      Authorization: authHeader,
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    console.warn(`[Jira] Failed to link issues ${inwardIssue} <-> ${outwardIssue}:`, response.status, errorText);
+    // Don't throw - linking is optional
+    return false;
+  }
+
+  return true;
+}
+
 // --- AI Helper Function ---
 // This function takes the raw text and asks Perplexity to structure it.
 async function runAIAnalysis(requirementsText) {
@@ -271,6 +300,36 @@ app.post('/api/generate-tickets', upload.single('requirementsFile'), async (req,
     // --- Step 3: Create Jira issues in real time ---
     const creationResults = [];
 
+    // Create a parent epic for this upload to group all epics from this specific upload
+    const uploadTimestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
+    const parentEpicSummary = `Requirements Upload - ${uploadTimestamp}`;
+    const parentEpicDescription = `Parent epic grouping all epics and stories generated from requirements document uploaded on ${new Date().toLocaleString()}.`;
+
+    const parentEpicFields = {
+      project: { key: projectKey },
+      summary: parentEpicSummary,
+      description: toADF(parentEpicDescription),
+      issuetype: { name: EPIC_ISSUE_TYPE_NAME },
+      labels: [`upload-${uploadTimestamp}`], // Label to group all issues from this upload
+    };
+
+    if (EPIC_NAME_FIELD_ID && EPIC_NAME_FIELD_ID !== 'skip') {
+      parentEpicFields[EPIC_NAME_FIELD_ID] = parentEpicSummary;
+    }
+
+    let parentEpicKey = null;
+    try {
+      const parentEpicIssue = await createJiraIssue({
+        jiraUrl: normalizedJiraUrl,
+        authHeader: jiraAuth,
+        fields: parentEpicFields,
+      });
+      parentEpicKey = parentEpicIssue.key;
+      console.log(`[Jira] Created parent epic: ${parentEpicKey} - ${parentEpicSummary}`);
+    } catch (err) {
+      console.warn('[Jira] Failed to create parent epic, continuing without it:', err.message);
+    }
+
     if (structuredData.epics && Array.isArray(structuredData.epics)) {
       for (const epic of structuredData.epics) {
         const epicSummary = epic.summary || 'Epic';
@@ -282,6 +341,7 @@ app.post('/api/generate-tickets', upload.single('requirementsFile'), async (req,
           summary: epicSummary,
           description: toADF(epicDescription),
           issuetype: { name: EPIC_ISSUE_TYPE_NAME },
+          labels: [`upload-${uploadTimestamp}`], // Label to group epics from same upload
         };
         // Epic Name field (required for many company-managed projects). If your project does not
         // require it, or uses a different field id, set JIRA_EPIC_NAME_FIELD_ID in .env or leave empty.
@@ -296,6 +356,17 @@ app.post('/api/generate-tickets', upload.single('requirementsFile'), async (req,
         });
 
         const epicKey = epicIssue.key;
+
+        // Link this epic to the parent epic if parent was created
+        if (parentEpicKey) {
+          await linkJiraIssues({
+            jiraUrl: normalizedJiraUrl,
+            authHeader: jiraAuth,
+            inwardIssue: parentEpicKey,
+            outwardIssue: epicKey,
+            linkType: 'Relates'
+          });
+        }
         const storiesCreated = [];
 
         if (epic.stories && Array.isArray(epic.stories)) {
@@ -333,12 +404,18 @@ app.post('/api/generate-tickets', upload.single('requirementsFile'), async (req,
       message: 'Requirements analyzed and Jira issues created successfully!',
       stats: {
         epics: structuredData.epics ? structuredData.epics.length : 0,
+        parentEpic: parentEpicKey,
+        uploadLabel: `upload-${uploadTimestamp}`,
       },
       aiOutput: structuredData,
-      jira: creationResults,
+      jira: {
+        parentEpic: parentEpicKey,
+        childEpics: creationResults,
+      },
       notes: {
         epicNameField: EPIC_NAME_FIELD_ID || null,
         epicLinkField: EPIC_LINK_FIELD_ID || null,
+        uploadTimestamp: uploadTimestamp,
       },
     });
 
