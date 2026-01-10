@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Jira Ticket Generator</title>
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+    <!-- Favicon (optional, using emoji for now) -->
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🎫</text></svg>">
+</head>
+<body>
+    <div class="container">
+        <div class="glass-card">
+            <header>
+                <h1>Jira Wizard</h1>
+                <p class="subtitle">Transform Requirements into Tickets with AI</p>
+            </header>
+
+            <form id="generator-form">
+                <div class="form-group">
+                    <label for="jiraUrl">Jira Domain</label>
+                    <input type="text" id="jiraUrl" name="jiraUrl" placeholder="e.g. yourcompany.atlassian.net" required>
+                </div>
+
+                <div class="form-group">
+                    <label for="projectKey">Project Key</label>
+                    <input type="text" id="projectKey" name="projectKey" placeholder="e.g. PROJ" required>
+                </div>
+
+                <div class="form-group">
+                    <label for="email">Email Address</label>
+                    <input type="email" id="email" name="email" placeholder="name@company.com" required>
+                </div>
+
+                <div class="form-group">
+                    <label for="apiToken">API Token</label>
+                    <input type="password" id="apiToken" name="apiToken" placeholder="Atlassian API Token" required>
+                </div>
+
+                <div class="file-upload-wrapper">
+                    <label class="file-upload-label" for="requirementsFile">
+                        <svg class="upload-icon" viewBox="0 0 24 24">
+                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                            <polyline points="17 8 12 3 7 8"></polyline>
+                            <line x1="12" y1="3" x2="12" y2="15"></line>
+                        </svg>
+                        <span class="file-upload-text">Click to upload requirements (TXT, MD)</span>
+                        <span class="file-name" id="file-name"></span>
+                    </label>
+                    <input type="file" id="requirementsFile" name="requirementsFile" class="file-upload-input" accept=".txt,.md,.pdf,image/*" required>
+                </div>
+
+                <button type="submit" class="btn-primary" id="submit-btn">
+                    Generate Tickets
+                </button>
+            </form>
+
+            <div id="status-area">
+                <div class="status-card">
+                    <div id="status-header" class="status-title">Processing...</div>
+                    <div id="status-content" class="status-message"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
